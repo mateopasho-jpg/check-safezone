@@ -1,9 +1,9 @@
 from __future__ import annotations
-import io, logging, os, re
+import base64, io, logging, os, re
 from typing import Any, Dict, List, Optional
 import easyocr, requests
 from fastapi import FastAPI, HTTPException, Header
-from PIL import Image
+from PIL import Image, ImageDraw
 from pydantic import BaseModel
 
 logging.basicConfig(level=logging.INFO)
@@ -27,6 +27,7 @@ def get_reader():
 class CheckRequest(BaseModel):
     file_id: str
     file_name: Optional[str] = None
+    visualize: Optional[bool] = True
 
 def _require_api_key(x_api_key):
     expected = (os.getenv("SERVICE_API_KEY") or "").strip()
@@ -67,30 +68,30 @@ def _download_image(file_id: str) -> bytes:
                     raw2 = r2.content or b""
                     h2 = raw2[:512].lstrip().lower()
                     if not h2.startswith(b"<!doctype") and not h2.startswith(b"<html") and len(raw2) > 1024:
-                        logger.info("Downloaded via confirm: %d bytes", len(raw2))
                         return raw2
                 continue
             if len(raw) < 1024:
-                logger.warning("Too small (%d bytes) from %s", len(raw), url)
                 continue
-            logger.info("Downloaded: %d bytes from %s", len(raw), url)
             return raw
         except Exception as e:
             last_error = e
             logger.warning("Failed %s: %s", url, e)
     raise ValueError("Could not download image. Last error: " + str(last_error))
 
-def _check_safe_zone(image_bytes: bytes) -> List[Dict[str, Any]]:
-    img = Image.open(io.BytesIO(image_bytes))
+def _run_check_and_visualize(image_bytes: bytes, visualize: bool):
+    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     width, height = img.size
+
     safe_top    = height * SAFE_TOP_PCT
     safe_bottom = height * (1 - SAFE_BOTTOM_PCT)
     safe_left   = width  * SAFE_LEFT_PCT
     safe_right  = width  * (1 - SAFE_RIGHT_PCT)
-    logger.info("Image: %dx%dpx | Safe zone top=%.0f bottom=%.0f left=%.0f right=%.0f",
-                width, height, safe_top, safe_bottom, safe_left, safe_right)
+
+    logger.info("Image: %dx%dpx", width, height)
     results = get_reader().readtext(image_bytes, detail=1)
+
     violations = []
+    all_detections = []
     for (bbox, text, confidence) in results:
         if confidence < 0.3:
             continue
@@ -103,13 +104,65 @@ def _check_safe_zone(image_bytes: bytes) -> List[Dict[str, Any]]:
         if y_max > safe_bottom: zones.append("bottom 20%")
         if x_min < safe_left:   zones.append("left 6%")
         if x_max > safe_right:  zones.append("right 6%")
-        if zones:
-            violations.append({"text": text, "confidence": round(confidence, 2),
-                                "zone": ", ".join(zones),
-                                "position": {"x_min": round(x_min), "y_min": round(y_min),
-                                             "x_max": round(x_max), "y_max": round(y_max)}})
+        is_violation = len(zones) > 0
+        all_detections.append((x_min, y_min, x_max, y_max, text, confidence, zones, is_violation))
+        if is_violation:
+            violations.append({
+                "text": text,
+                "confidence": round(confidence, 2),
+                "zone": ", ".join(zones),
+                "position": {"x_min": round(x_min), "y_min": round(y_min),
+                             "x_max": round(x_max), "y_max": round(y_max)},
+            })
             logger.warning("Violation: '%s' in %s", text, zones)
-    return violations
+
+    preview_b64 = None
+    if visualize:
+        # Scale down for preview (max 600px wide)
+        scale = min(1.0, 600 / width)
+        preview_w = int(width * scale)
+        preview_h = int(height * scale)
+        preview = img.resize((preview_w, preview_h), Image.LANCZOS)
+        draw = ImageDraw.Draw(preview, "RGBA")
+
+        # Draw danger zones (semi-transparent red overlay)
+        danger_color = (220, 50, 50, 80)
+        # top zone
+        draw.rectangle([0, 0, preview_w, int(safe_top * scale)], fill=danger_color)
+        # bottom zone
+        draw.rectangle([0, int(safe_bottom * scale), preview_w, preview_h], fill=danger_color)
+        # left zone
+        draw.rectangle([0, 0, int(safe_left * scale), preview_h], fill=danger_color)
+        # right zone
+        draw.rectangle([int(safe_right * scale), 0, preview_w, preview_h], fill=danger_color)
+
+        # Draw safe zone border (green dashed line simulation)
+        border_color = (0, 200, 0, 255)
+        border_w = max(2, int(3 * scale))
+        draw.rectangle(
+            [int(safe_left * scale), int(safe_top * scale),
+             int(safe_right * scale), int(safe_bottom * scale)],
+            outline=border_color, width=border_w
+        )
+
+        # Draw detected text boxes
+        for (x_min, y_min, x_max, y_max, text, conf, zones, is_violation) in all_detections:
+            color = (255, 50, 50, 255) if is_violation else (50, 200, 50, 255)
+            draw.rectangle(
+                [int(x_min * scale), int(y_min * scale),
+                 int(x_max * scale), int(y_max * scale)],
+                outline=color, width=max(2, int(2 * scale))
+            )
+            # Label
+            label = text[:20] + ("..." if len(text) > 20 else "")
+            draw.text((int(x_min * scale), int(y_min * scale) - 14),
+                      label, fill=color)
+
+        buf = io.BytesIO()
+        preview.save(buf, format="JPEG", quality=85)
+        preview_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+
+    return violations, preview_b64
 
 @app.get("/health")
 def health():
@@ -121,17 +174,25 @@ def check_safezone(req: CheckRequest,
     _require_api_key(x_api_key)
     file_name = req.file_name or req.file_id
     try:
-        logger.info("Downloading: %s", req.file_id)
         image_bytes = _download_image(req.file_id)
     except Exception as e:
         raise HTTPException(status_code=422, detail="Could not download image: " + str(e))
     try:
-        violations = _check_safe_zone(image_bytes)
+        violations, preview_b64 = _run_check_and_visualize(image_bytes, True)
     except Exception as e:
         raise HTTPException(status_code=500, detail="OCR processing failed: " + str(e))
+
     passed = len(violations) == 0
-    result = {"ok": True, "file_id": req.file_id, "file_name": file_name,
-              "passed": passed, "violations": violations}
+    result = {
+        "ok": True,
+        "file_id": req.file_id,
+        "file_name": file_name,
+        "passed": passed,
+        "violations": violations,
+    }
+    if preview_b64:
+        result["preview_base64"] = preview_b64
+
     if not passed:
         parts = ["'" + v["text"] + "' (" + v["zone"] + ")" for v in violations]
         result["message"] = "Safe zone violation in *" + file_name + "*: Text outside safe zone - " + ", ".join(parts)
