@@ -8,14 +8,7 @@ FastAPI service that checks whether text in an image falls within the safe zone 
 - Left: 6% from left edge
 - Right: 6% from right edge
 
-## Deployment (Railway)
 
-1. Create a new Railway service from this repo/directory
-2. Railway will use the Dockerfile automatically
-3. Set environment variable (optional): `SERVICE_API_KEY=your_secret_key`
-4. Note the deployed URL (e.g. `https://safezone-check-production.up.railway.app`)
-
-## API
 
 ### POST /check-safezone
 
